@@ -9,12 +9,29 @@ import platform
 import subprocess
 import datetime as dt
 import sys
+import os
+import shutil
+import json
+# import os.path
 
+class PropertyBag(dict):
+    def to_string(self, device_name:str):
+        for key in self.keys():
+            self[key] = str.replace(self[key], "{device_name}", device_name)
+        return str.replace(str.replace(json.dumps(self), "{", ''), "}", '')
+
+# Only needed if using alternate method of obtaining CPU temperature (see commented out code for approach)
+#from os import walk
+
+
+rpi_power_disabled = True
 try:
     from rpi_bad_power import new_under_voltage
-    rpi_power_disabled = False
+    if new_under_voltage() is not None:
+        # Only enable if import works and function returns a value
+        rpi_power_disabled = False
 except ImportError:
-    rpi_power_disabled = True
+    pass
 
 try:
     import apt
@@ -22,16 +39,30 @@ try:
 except ImportError:
     apt_disabled = True
 
+isDockerized = bool(os.getenv('YES_YOU_ARE_IN_A_CONTAINER', False))
+isOsRelease = os.path.isfile('/app/host/os-release')
+isHostname = os.path.isfile('/app/host/hostname')
+isDeviceTreeModel = os.path.isfile('/app/host/proc/device-tree/model')
+isSystemSensorPipe = os.path.isfile('/app/host/system_sensor_pipe')
+
+vcgencmd   = "vcgencmd"
+os_release = "/etc/os-release"
+if isDockerized:
+    os_release = "/app/host/os-release" if isOsRelease else '/etc/os-release'
+    vcgencmd   = "/opt/vc/bin/vcgencmd"
 
 # Get OS information
 OS_DATA = {}
-with open('/etc/os-release') as f:
+with open(os_release) as f:
     for line in f.readlines():
-        row = line.strip().split("=")
-        OS_DATA[row[0]] = row[1].strip('"')
+        if not line in ['\n', '\r\n']:
+            row = line.strip().split("=")
+            OS_DATA[row[0]] = row[1].strip('"')
 
-old_net_data = psutil.net_io_counters()
-previous_time = time.time() - 10
+old_net_data_tx = psutil.net_io_counters()[0]
+previous_time_tx = time.time() - 10
+old_net_data_rx = psutil.net_io_counters()[1]
+previous_time_rx = time.time() - 10
 UTC = pytz.utc
 DEFAULT_TIME_ZONE = None
 
@@ -41,7 +72,6 @@ if not rpi_power_disabled:
 def set_default_timezone(timezone):
     global DEFAULT_TIME_ZONE
     DEFAULT_TIME_ZONE = timezone
-
 
 def write_message_to_console(message):
     print(message)
@@ -75,50 +105,136 @@ def get_updates():
 
 # Temperature method depending on system distro
 def get_temp():
-    temp = ''
-    if 'rasp' in OS_DATA['ID']:
-        reading = subprocess.check_output(['vcgencmd', 'measure_temp']).decode('UTF-8')
-        temp = str(re.findall('\d+.\d+', reading)[0])
-    else:
-        reading = subprocess.check_output(['cat', '/sys/class/thermal/thermal_zone0/temp']).decode('UTF-8')
-        temp = str(reading[0] + reading[1] + '.' + reading[2]) # why?? need linux system to test
-    return temp
+    # Note that 'Unknown' can be problematic if no temp sensor is found, see get_fan_speed for the reason.
+    # Alternatively, the default can be changed to -273 which is unlikely to happen...
+    temp = 'Unknown'
+    # Utilising psutil for temp reading on ARM arch
+    try:
+        t = psutil.sensors_temperatures()
+        for x in ['cpu-thermal', 'cpu_thermal', 'coretemp', 'soc_thermal', 'k10temp']:
+            if x in t:
+                temp = t[x][0].current
+                break
+    except Exception as e:
+            print('Could not establish CPU temperature reading: ' + str(e))
+            raise
+    return round(temp, 1) if temp != 'Unknown' else temp
 
-# Clock speed method depending on system distro
+            # Option to use thermal_zone readings instead of psutil
+
+            # base_dir = '/sys/class/thermal/'
+            # zone_dir = ''
+            # print('Could not cpu_thermal property. Checking thermal zone for x86 architecture')
+            # for root, dir, files in walk(base_dir):
+            #     for d in dir:
+            #         if 'thermal_zone' in d:
+            #             temp_type = str(subprocess.check_output(['cat', base_dir + d + '/type']).decode('UTF-8'))
+            #             if 'x86' in temp_type:
+            #                 zone_dir = d
+            #                 break
+            # temp = str(int(subprocess.check_output(['cat', base_dir + zone_dir + '/temp']).decode('UTF-8')) / 1000)
+
+
+def get_fan_speed():
+    # Formerly the default was 'Unknown' which generates in HA a string/number mismatch error if no fan is found
+    speed = -1
+    # Utilising psutil for fan speed reading on ARM arch
+    try:
+        if not hasattr(psutil, "sensors_fans"):
+            raise NotImplementedError("Platform does not support sensors_fans")
+
+        t = psutil.sensors_fans()
+        # if additional fan names returned by psutil are needed, add them here (see get_temp as example)
+        for x in ['pwmfan', ]:
+            if x in t:
+                speed = t[x][0].current
+                break
+    except (Exception, NotImplementedError) as e:
+        print('Could not establish fan speed reading: ' + str(e))
+        raise
+    return round(speed, 0)
+
+
+# display power method depending on system distro
+def get_display_status():
+    if "rasp" in OS_DATA["ID"]:
+        reading = subprocess.check_output([vcgencmd, "display_power"]).decode("UTF-8")
+        display_state = str(re.findall("^display_power=(?P<display_state>[01]{1})$", reading)[0])
+    else:
+        display_state = "Unknown"
+    return display_state
+
+# Replaced with psutil method - does this not work fine?
 def get_clock_speed():
-    clock_speed = ''
-    if 'rasp' in OS_DATA['ID']:
-        reading = subprocess.check_output(['vcgencmd', 'measure_clock','arm']).decode('UTF-8')
-        clock_speed = str(int(re.findall('\d+', reading)[1]) / 1000000)
-    else: # need linux system to test
-        reading = subprocess.check_output(['cat', '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq']).decode('UTF-8')
-        clock_speed = str(int(re.findall('\d+', reading)[0]) / 1000)
+    clock_speed = int(psutil.cpu_freq().current)
     return clock_speed
 
 def get_disk_usage(path):
-    return str(psutil.disk_usage(path).percent)
+    try:
+        disk_percentage = str(psutil.disk_usage(path).percent)
+        return disk_percentage
+    except Exception as e:
+        print('Error while trying to obtain disk usage from ' + str(path) + ' with exception: ' + str(e))
+        return None # Changed to return None for handling exception at function call location
 
+def get_zpool_use(pool):
+    zpool_locations = ['/usr/sbin/zpool', '/sbin/zpool']
+    zpool_binary = shutil.which("zpool") or next(filter(lambda l: os.path.isfile(l), zpool_locations), None)
+    try:
+        zpool_percentage = str(subprocess.check_output(
+            [
+                zpool_binary,
+                'list',
+                '-H',
+                '-o',
+                'capacity',
+                '-p',
+                pool
+            ], timeout=2
+        ).decode('utf-8')).strip('\n')
+        return zpool_percentage
+    except Exception as e:
+        print('Error while trying to obtain zpool usage from ' +
+              str(pool) + ' with exception: ' + str(e))
+        return None  # Changed to return None for handling exception at function call location
 
 def get_memory_usage():
     return str(psutil.virtual_memory().percent)
 
-
 def get_load(arg):
-    return str(psutil.getloadavg()[arg])
+    return round(psutil.getloadavg()[arg] / psutil.cpu_count() * 100, 1)
 
-def get_net_data(arg):
-    global old_net_data
-    global previous_time
-    current_net_data = psutil.net_io_counters()
+def get_net_data_tx(interface = True):
+    global old_net_data_tx
+    global previous_time_tx
+    current_net_data = []
+    if type(interface) == str:
+        current_net_data = psutil.net_io_counters(pernic=True)[interface][0]
+    else:
+        current_net_data = psutil.net_io_counters()[0]
     current_time = time.time()
-    if current_time == previous_time:
+    if current_time == previous_time_tx:
         current_time += 1
-    net_data = (current_net_data[0] - old_net_data[0]) / (current_time - previous_time) * 8 / 1024
-    net_data = (net_data, (current_net_data[1] - old_net_data[1]) / (current_time - previous_time) * 8 / 1024)
-    previous_time = current_time
-    old_net_data = current_net_data
-    net_data = ['%.2f' % net_data[0], '%.2f' % net_data[1]]
-    return net_data[arg]
+    net_data = (current_net_data - old_net_data_tx) * 8 / (current_time - previous_time_tx) / 1024
+    previous_time_tx = current_time
+    old_net_data_tx = current_net_data
+    return f"{net_data:.2f}"
+
+def get_net_data_rx(interface = True):
+    global old_net_data_rx
+    global previous_time_rx
+    current_net_data = []
+    if type(interface) == str:
+        current_net_data = psutil.net_io_counters(pernic=True)[interface][1]
+    else:
+        current_net_data = psutil.net_io_counters()[1]
+    current_time = time.time()
+    if current_time == previous_time_rx:
+        current_time += 1
+    net_data = (current_net_data - old_net_data_rx) * 8 / (current_time - previous_time_rx) / 1024
+    previous_time_rx = current_time
+    old_net_data_rx = current_net_data
+    return f"{net_data:.2f}"
 
 def get_cpu_usage():
     return str(psutil.cpu_percent(interval=None))
@@ -154,23 +270,55 @@ def get_wifi_ssid():
     return (ssid)
 
 def get_rpi_power_status():
-    return _underVoltage.get()
+    return 'ON' if _underVoltage.get() else 'OFF'
 
 def get_hostname():
-    return socket.gethostname()
+    if isDockerized and isHostname:
+        host = subprocess.check_output(["cat", "/app/host/hostname"]).decode("UTF-8").strip()
+    else:
+        host = socket.gethostname()
+    return host
 
 def get_host_ip():
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(('8.8.8.8', 80))
-        return sock.getsockname()[0]
-    except socket.error:
+    if isDockerized and isSystemSensorPipe:
+        return get_container_host_ip()
+    else:
         try:
-            return socket.gethostbyname(socket.gethostname())
-        except socket.gaierror:
-            return '127.0.0.1'
-    finally:
-        sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(('8.8.8.8', 80))
+            return sock.getsockname()[0]
+        except socket.error:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except socket.gaierror:
+                return '127.0.0.1'
+        finally:
+            sock.close()
+
+def get_container_host_ip():
+     data = subprocess.check_output(["cat", "/app/host/system_sensor_pipe"]).decode("UTF-8")
+     ip = ""
+     for line in data.split('\n'):
+         mo = re.match ("^.{2}(?P<id>.{2}).{2}(?P<addr>.{8})..{4} .{8}..{4} (?P<status>.{2}).*|", line)
+         if mo and mo.group("id") != "sl":
+             status = int(mo.group("status"), 16)
+             if status == 1: # connection established
+                 ip = hex2addr(mo.group("addr"))
+                 break
+     return ip
+
+def hex2addr(hex_addr):
+    l = len(hex_addr)
+    first = True
+    ip = ""
+    for i in range(l // 2):
+        if (first != True):
+            ip = "%s." % ip
+        else:
+            first = False
+        ip = ip + ("%d" % int(hex_addr[-2:], 16))
+        hex_addr = hex_addr[:-2]
+    return ip
 
 def get_host_os():
     try:
@@ -184,66 +332,119 @@ def get_host_arch():
     except:
         return 'Unknown'
 
+# Builds an external drive entry to fix incorrect usage reporting
+def external_drive_base(drive, drive_path) -> dict:
+    return {
+        'name': f'Disk Use {drive}',
+        'unit': '%',
+        'icon': 'harddisk',
+        'sensor_type': 'sensor',
+        'function': lambda: get_disk_usage(f'{drive_path}')
+        }
+
+# Builds a zpool entry to fix incorrect usage reporting
+def zpool_base(pool) -> dict:
+    return {
+        'name': f'Zpool Use {pool}',
+        'unit': '%',
+        'icon': 'harddisk',
+        'sensor_type': 'sensor',
+        'function': lambda: get_zpool_use(f'{pool}')
+        }
+
 sensors = {
-          'temperature': 
+          'temperature':
                 {'name':'Temperature',
                  'class': 'temperature',
+                 'state_class':'measurement',
                  'unit': '°C',
                  'icon': 'thermometer',
                  'sensor_type': 'sensor',
                  'function': get_temp},
+            'fan_speed':
+                {'name': 'Fan Speed',
+                 'state_class': 'measurement',
+                 'unit': 'rpm',
+                 'icon': 'fan',
+                 'sensor_type': 'sensor',
+                 'function': get_fan_speed},
+          'display':
+                {'name':'Display Switch',
+                 'icon': 'monitor',
+                 'sensor_type': 'switch',
+                 'function': get_display_status,
+                 'prop': PropertyBag({
+                     'command_topic'      : 'system-sensors/sensor/{device_name}/command',
+                     'state_off'          : '0',
+                     'state_on'           : '1',
+                     'payload_off'        : 'display_off',
+                     'payload_on'         : 'display_on',
+                 })},
           'clock_speed':
                 {'name':'Clock Speed',
+                 'state_class':'measurement',
                  'unit': 'MHz',
                  'sensor_type': 'sensor',
                  'function': get_clock_speed},
           'disk_use':
                 {'name':'Disk Use',
+                 'state_class':'measurement',
                  'unit': '%',
                  'icon': 'micro-sd',
                  'sensor_type': 'sensor',
                  'function': lambda: get_disk_usage('/')},
           'memory_use':
                 {'name':'Memory Use',
+                 'state_class':'measurement',
                  'unit': '%',
                  'icon': 'memory',
                  'sensor_type': 'sensor',
                  'function': get_memory_usage},
           'cpu_usage':
                 {'name':'CPU Usage',
+                 'state_class':'measurement',
                  'unit': '%',
-                 'icon': 'memory',
+                 'icon': 'chip',
                  'sensor_type': 'sensor',
                  'function': get_cpu_usage},
           'load_1m':
                 {'name': 'Load 1m',
+                 'unit': '%',
+                 'state_class':'measurement',
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(0)},
           'load_5m':
                 {'name': 'Load 5m',
+                 'unit': '%',
+                 'state_class':'measurement',
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(1)},
           'load_15m':
                 {'name': 'Load 15m',
+                 'unit': '%',
+                 'state_class':'measurement',
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(2)},
           'net_tx':
                 {'name': 'Network Upload',
+                 'state_class':'measurement',
                  'unit': 'Kbps',
                  'icon': 'server-network',
                  'sensor_type': 'sensor',
-                 'function': lambda: get_net_data(0)},
+                 'function': get_net_data_tx},
           'net_rx':
                 {'name': 'Network Download',
+                 'state_class':'measurement',
                  'unit': 'Kbps',
                  'icon': 'server-network',
                  'sensor_type': 'sensor',
-                 'function': lambda: get_net_data(1)},
+                 'function': get_net_data_rx},
           'swap_usage':
                 {'name':'Swap Usage',
+                 'state_class':'measurement',
                  'unit': '%',
                  'icon': 'harddisk',
                  'sensor_type': 'sensor',
@@ -285,22 +486,23 @@ sensors = {
                  'icon': 'clock-check',
                  'sensor_type': 'sensor',
                  'function': get_last_message},
-          'updates': 
+          'updates':
                 {'name':'Updates',
                  'icon': 'cellphone-arrow-down',
                  'sensor_type': 'sensor',
                  'function': get_updates},
-          'wifi_strength': 
+          'wifi_strength':
                 {'class': 'signal_strength',
+                 'state_class':'measurement',
                  'name':'Wifi Strength',
                  'unit': 'dBm',
                  'icon': 'wifi',
                  'sensor_type': 'sensor',
                  'function': get_wifi_strength},
-          'wifi_ssid': 
-                {'class': 'signal_strength',
-                 'name':'Wifi SSID',
+          'wifi_ssid':
+                {'name':'Wifi SSID',
                  'icon': 'wifi',
                  'sensor_type': 'sensor',
                  'function': get_wifi_ssid},
           }
+
